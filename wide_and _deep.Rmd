@@ -1,0 +1,216 @@
+---
+title: "Untitled"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# inspiracao https://github.com/prodipta/R-examples/blob/master/wide_and_deep.R
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(keras)
+
+
+train <- read.csv(unzip("train.csv (1).zip"))
+test <- read.csv(unzip("test.csv (1).zip"))
+
+```
+
+```{r}
+x_train <- train %>% select(-id, -target)
+x_test <- test %>% select(-id)
+
+y <- str_extract(train$target, "\\d") %>% as.numeric()
+y <- to_categorical(y)[, 2:10]
+
+data <- list(train = x_train,
+             test = x_test)
+```
+
+
+```{r}
+# one_hot_encoding <- function(data, cols){
+#   ohc <- model.matrix(~ . + 0, data=data[,cols], contrasts.arg = 
+#                         lapply(data[,cols],contrasts,contrasts=FALSE))
+#   return(ohc)
+# }
+
+preprocess_data <- function(data, wide_cols, deep_cols, y){
+  
+  train <- list(wide=data$train[,wide_cols],
+                deep=data$train[,deep_cols],
+                y=y)
+  
+  test <- list(wide=data$test[,wide_cols],
+               deep=data$test[,deep_cols],
+               y=NA)
+  
+  return(list(train=train,test=test))
+}
+```
+
+```{r}
+# pre-process: split wide and deep variables, one-hot-encode deep variables
+wide_cols <- colnames(x_train)[which(map_lgl(x_train, ~length(unique(.x))>=100))]
+deep_cols <- colnames(x_train)[which(map_lgl(x_train, ~length(unique(.x))<100))]
+
+#data <- map(data, ~mutate_at(.x, deep_cols, as.factor))
+data <- preprocess_data(data, wide_cols, deep_cols, y)
+
+# set up the network and training parameters
+size_deep <- NCOL(data$train$deep)
+size_wide <- NCOL(data$train$wide)
+drop_out <- 0.3
+epoch <- 100
+batchsize <- 256
+activation_fn <- "relu"
+
+```
+
+
+```{r}
+# design the network
+wide <- layer_input(size_wide)
+
+encoded_wide <- wide %>% 
+  layer_dense(units = 1, activation = 'relu')
+
+deep <- layer_input(size_deep)
+
+encoded_deep <- deep %>% 
+  layer_embedding(input_dim = 360, output_dim =  9, input_length = size_deep) %>%
+  
+  layer_conv_1d(filters = 8, kernel_size = 1, activation = 'relu') %>%
+  layer_flatten() %>%
+  layer_dropout(0.3) %>%
+  
+  layer_dense(units = 128, activation = 'relu') %>% 
+  layer_batch_normalization() %>% 
+  layer_dropout(0.3) %>%
+  
+  layer_dense(units = 64, activation = 'relu') %>% 
+  layer_batch_normalization() %>% 
+  layer_dropout(0.3) %>%
+  
+  layer_dense(units = 32, activation = 'relu') %>% 
+  layer_batch_normalization() %>% 
+  layer_dropout(0.2) %>%
+  
+  layer_dense(units = 9, activation = "softmax")
+
+
+
+
+
+
+merged <- list(encoded_wide, encoded_deep) %>%
+  layer_concatenate(axis=1) %>%
+  layer_dropout(rate=drop_out)
+
+preds <- merged %>%
+  layer_dense(units=9, activation = activation_fn)
+
+wide_n_deep <- keras_model(inputs = list(wide,deep), outputs = preds)
+
+wide_n_deep %>% compile(
+  loss = 'categorical_crossentropy',
+  optimizer = 'adam'
+)
+```
+
+```{r}
+early_stopping <- callback_early_stopping(
+  monitor = "val_loss",
+  min_delta = 0.0000001,
+  patience = 15,
+  restore_best_weights = TRUE
+)
+
+plateau <- callback_reduce_lr_on_plateau(
+  monitor = "val_loss",
+  factor = 0.05,
+  patience = 2,
+  verbose = 1,
+  min_delta = 0.0000001,
+  cooldown = 0,
+  min_lr = 0
+)
+```
+
+
+```{r}
+# train the network
+wide_n_deep %>% fit(
+  x = list(as.matrix(data$train$wide), as.matrix(data$train$deep)),
+  y = data$train$y,
+  batch_size = batchsize,
+  epochs = epoch,
+  validation_split=0.2,
+  callbacks = c(early_stopping, plateau)
+)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+to_categorical(y)
+```
+
+```{r}
+input <- layer_input(shape = ncol(x_train))
+
+
+output <- input %>% 
+  layer_embedding(input_dim = 360, output_dim =  8, input_length = 75) %>% 
+  layer_conv_1d(filters = 16, kernel_size = 1, activation = 'relu') %>% 
+  layer_flatten() %>% 
+  layer_dropout(0.3) %>% 
+  
+  layer_dense(units = 128, activation = 'relu') %>% 
+  layer_batch_normalization() %>% 
+  layer_dropout(0.3) %>% 
+  
+  layer_dense(units = 64, activation = 'relu') %>% 
+  layer_batch_normalization() %>% 
+  layer_dropout(0.3) %>% 
+  
+  layer_dense(units = 32, activation = 'relu') %>% 
+  layer_batch_normalization() %>% 
+  layer_dropout(0.2) %>% 
+  
+  layer_dense(units = 9)
+
+
+
+model <- keras_model(input, output)
+
+
+tfestimators::linear_classifier()
+
+library(reticulate)
+reticulate::py_install("keras")
+keras_experimental <- import('keras.experimental')
+
+model
+
+
+
+```
+
