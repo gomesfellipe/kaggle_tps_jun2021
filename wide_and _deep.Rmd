@@ -12,10 +12,9 @@ knitr::opts_chunk$set(echo = TRUE)
 library(tidyverse)
 library(keras)
 
-
-train <- read.csv(unzip("train.csv (1).zip"))
-test <- read.csv(unzip("test.csv (1).zip"))
-
+train <- read_csv("train.csv")
+test <- read_csv("test.csv")
+# sub <- read_csv("sample_submission.csv")
 ```
 
 ```{r}
@@ -25,8 +24,7 @@ x_test <- test %>% select(-id)
 y <- str_extract(train$target, "\\d") %>% as.numeric()
 y <- to_categorical(y)[, 2:10]
 
-data <- list(train = x_train,
-             test = x_test)
+data <- list(train = x_train, test = x_test)
 ```
 
 
@@ -39,15 +37,17 @@ data <- list(train = x_train,
 
 preprocess_data <- function(data, wide_cols, deep_cols, y){
   
-  train <- list(wide=data$train[,wide_cols],
+  return(
+    list(
+      train=list(wide=data$train[,wide_cols],
                 deep=data$train[,deep_cols],
-                y=y)
-  
-  test <- list(wide=data$test[,wide_cols],
+                y=y),
+      test=list(wide=data$test[,wide_cols],
                deep=data$test[,deep_cols],
                y=NA)
-  
-  return(list(train=train,test=test))
+    )
+  )
+
 }
 ```
 
@@ -58,66 +58,15 @@ deep_cols <- colnames(x_train)[which(map_lgl(x_train, ~length(unique(.x))<100))]
 
 #data <- map(data, ~mutate_at(.x, deep_cols, as.factor))
 data <- preprocess_data(data, wide_cols, deep_cols, y)
+```
 
+```{r}
 # set up the network and training parameters
 size_deep <- NCOL(data$train$deep)
 size_wide <- NCOL(data$train$wide)
-drop_out <- 0.3
 epoch <- 100
-batchsize <- 256
-activation_fn <- "relu"
-
-```
-
-
-```{r}
-# design the network
-wide <- layer_input(size_wide)
-
-encoded_wide <- wide %>% 
-  layer_dense(units = 1, activation = 'relu')
-
-deep <- layer_input(size_deep)
-
-encoded_deep <- deep %>% 
-  layer_embedding(input_dim = 360, output_dim =  9, input_length = size_deep) %>%
-  
-  layer_conv_1d(filters = 8, kernel_size = 1, activation = 'relu') %>%
-  layer_flatten() %>%
-  layer_dropout(0.3) %>%
-  
-  layer_dense(units = 128, activation = 'relu') %>% 
-  layer_batch_normalization() %>% 
-  layer_dropout(0.3) %>%
-  
-  layer_dense(units = 64, activation = 'relu') %>% 
-  layer_batch_normalization() %>% 
-  layer_dropout(0.3) %>%
-  
-  layer_dense(units = 32, activation = 'relu') %>% 
-  layer_batch_normalization() %>% 
-  layer_dropout(0.2) %>%
-  
-  layer_dense(units = 9, activation = "softmax")
-
-
-
-
-
-
-merged <- list(encoded_wide, encoded_deep) %>%
-  layer_concatenate(axis=1) %>%
-  layer_dropout(rate=drop_out)
-
-preds <- merged %>%
-  layer_dense(units=9, activation = activation_fn)
-
-wide_n_deep <- keras_model(inputs = list(wide,deep), outputs = preds)
-
-wide_n_deep %>% compile(
-  loss = 'categorical_crossentropy',
-  optimizer = 'adam'
-)
+batchsize <- 128
+folds <- 8
 ```
 
 ```{r}
@@ -139,20 +88,132 @@ plateau <- callback_reduce_lr_on_plateau(
 )
 ```
 
+```{r}
+wd_model <- function(){
+  # design the network
+  wide <- layer_input(size_wide)
+  
+  encoded_wide <- wide %>% 
+    layer_dense(units = 1, activation = 'relu')
+  
+  deep <- layer_input(size_deep)
+  
+  encoded_deep <- deep %>% 
+    layer_embedding(input_dim = 360, output_dim =  8, input_length = size_deep) %>%
+    
+    layer_conv_1d(filters = 16, kernel_size = 1, activation = 'relu') %>%
+    layer_flatten() %>%
+    layer_dropout(0.3) %>%
+    
+    layer_dense(units = 128, activation = 'relu') %>% 
+    layer_batch_normalization() %>% 
+    layer_dropout(0.3) %>%
+    
+    layer_dense(units = 64, activation = 'relu') %>% 
+    layer_batch_normalization() %>% 
+    layer_dropout(0.3) %>%
+    
+    layer_dense(units = 32, activation = 'relu') %>% 
+    layer_batch_normalization() %>% 
+    layer_dropout(0.2) %>%
+    
+    layer_dense(units = 9)
+  
+  merged <- list(encoded_wide, encoded_deep) %>%
+    layer_concatenate(axis=1) %>%
+    layer_dropout(rate=0.3)
+  
+  preds <- merged %>%
+    layer_dense(units=9, activation = "softmax")
+  
+  wide_n_deep <- keras_model(inputs = list(wide,deep), outputs = preds)
+  
+  return(wide_n_deep)
+}
+
+wide_n_deep <- wd_model()
+
+wide_n_deep %>%
+  compile(
+    loss = 'categorical_crossentropy',
+    optimizer = optimizer_adam(
+      lr = 0.002) )
+
+```
 
 ```{r}
 # train the network
-wide_n_deep %>% fit(
-  x = list(as.matrix(data$train$wide), as.matrix(data$train$deep)),
+history <- wide_n_deep %>% fit(
+  x = list(as.matrix(data$train$wide), 
+           as.matrix(data$train$deep)),
   y = data$train$y,
   batch_size = batchsize,
-  epochs = epoch,
+  epochs = 2,
   validation_split=0.2,
   callbacks = c(early_stopping, plateau)
 )
 ```
 
+```{r}
+history
+```
 
+```{r}
+plot(history)
+```
+
+# K-FoLd prediction
+
+```{r}
+kf <- caret::createFolds(train$target, 8)
+
+sub_nn <- matrix(0, nrow(x_test), ncol(y))
+oof_nn <- matrix(0, nrow(x_train), ncol(y))
+oof_logloss <- c()
+
+for(i in 1:folds){
+  train_idx <- unlist(kf[-i])
+  val_idx   <- kf[[i]]
+  
+  wide_n_deep <- wd_model()
+  
+  wide_n_deep %>%
+    compile(
+      loss = 'categorical_crossentropy',
+      optimizer = optimizer_adam(
+        lr = 0.002) )
+  
+  wide_n_deep %>% fit(
+    x = list(as.matrix(data$train$wide)[train_idx, ], 
+             as.matrix(data$train$deep)[train_idx, ]),
+    y = data$train$y[train_idx, ],
+    batch_size = batchsize,
+    epochs = 1,
+    validation_split=0.2,
+    callbacks = c(early_stopping, plateau)
+  )
+  
+  oof_nn[val_idx, ] <- predict(wide_n_deep, 
+                               list(as.matrix(data$train$wide[val_idx, ]),
+                                    as.matrix(data$train$deep)[val_idx, ]))
+  
+  sub_nn <- sub_nn + predict(wide_n_deep, 
+                             list(as.matrix(data$test$wide),
+                                  as.matrix(data$test$deep))) / folds
+  
+  oof_loss <- yardstick::mn_log_loss_vec(
+    truth = factor(train$target),
+    estimate = oof_nn)
+  
+  oof_logloss <- c(oof_logloss, oof_loss)
+  
+}
+
+```
+
+```{r}
+print(glue::glue("CV Logloss: {mean(oof_logloss)}"))
+```
 
 
 
@@ -170,47 +231,22 @@ wide_n_deep %>% fit(
 
 
 ```{r}
-to_categorical(y)
+y_hat <- predict(wide_n_deep, list(as.matrix(data$test$wide),as.matrix(data$test$deep)))
+as_tibble(y_hat)
+sub %>% 
+  select(id) %>%
+  bind_cols(
+    rename_all(y_hat,~stringr::str_remove(.x, "\\.pred_"))) %>% 
+  readr::write_csv("lgbm_default_baseline.csv")
 ```
 
-```{r}
-input <- layer_input(shape = ncol(x_train))
-
-
-output <- input %>% 
-  layer_embedding(input_dim = 360, output_dim =  8, input_length = 75) %>% 
-  layer_conv_1d(filters = 16, kernel_size = 1, activation = 'relu') %>% 
-  layer_flatten() %>% 
-  layer_dropout(0.3) %>% 
-  
-  layer_dense(units = 128, activation = 'relu') %>% 
-  layer_batch_normalization() %>% 
-  layer_dropout(0.3) %>% 
-  
-  layer_dense(units = 64, activation = 'relu') %>% 
-  layer_batch_normalization() %>% 
-  layer_dropout(0.3) %>% 
-  
-  layer_dense(units = 32, activation = 'relu') %>% 
-  layer_batch_normalization() %>% 
-  layer_dropout(0.2) %>% 
-  
-  layer_dense(units = 9)
 
 
 
-model <- keras_model(input, output)
-
-
-tfestimators::linear_classifier()
-
-library(reticulate)
-reticulate::py_install("keras")
-keras_experimental <- import('keras.experimental')
-
-model
 
 
 
-```
+
+
+
 
